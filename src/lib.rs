@@ -31,11 +31,11 @@
 //! ## Usage
 //! Create a new client and configure it with your app bundle id(s).
 //!
-//! ```
+//! ```no_run
 //! use apple_signin::AppleJwtClient;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<()> {
+//! async fn main() -> Result<(), apple_signin::AppleJwtError> {
 //!     let client = AppleJwtClient::new(&["com.example.myapp"]);
 //!     let payload = client.decode("[IDENTITY TOKEN]").await?;
 //!
@@ -277,5 +277,97 @@ impl<'de> Visitor<'de> for AppleBool {
         E: serde::de::Error,
     {
         Ok(v == "true")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Exercises the verification core (`try_decode`) offline: tokens are
+    //! signed with a throwaway test key whose public half is served as the JWK
+    //! set, the same shape Apple's `/auth/keys` returns.
+    use super::*;
+    use jsonwebtoken::jwk::Jwk;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const KEY: &[u8] = include_bytes!("../tests/fixtures/test_rsa_key.pem");
+    const OTHER_KEY: &[u8] = include_bytes!("../tests/fixtures/other_rsa_key.pem");
+    const KID: &str = "test-kid";
+    const BUNDLE: &str = "com.example.app";
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+    }
+
+    fn keyset() -> JwkSet {
+        let key = EncodingKey::from_rsa_pem(KEY).expect("test key");
+        let mut jwk = Jwk::from_encoding_key(&key, Algorithm::RS256).expect("jwk");
+        jwk.common.key_id = Some(KID.to_owned());
+        JwkSet { keys: vec![jwk] }
+    }
+
+    fn token(pem: &[u8], kid: &str, claims: &serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_owned());
+        encode(&header, claims, &EncodingKey::from_rsa_pem(pem).expect("key")).expect("sign")
+    }
+
+    fn claims(aud: &str, iss: &str, exp: u64) -> serde_json::Value {
+        serde_json::json!({
+            "aud": aud, "iss": iss, "exp": exp, "iat": now(),
+            "sub": "001234.abcdef", "email": "u@privaterelay.appleid.com",
+            "email_verified": "true", "is_private_email": true,
+        })
+    }
+
+    fn decode(token: &str) -> Result<JwtPayload, AppleJwtError> {
+        let client = AppleJwtClient::new(&[BUNDLE]);
+        AppleJwtClient::try_decode(KID, &keyset(), token, &client.validation)
+    }
+
+    #[test]
+    fn valid_token_decodes() {
+        let t = token(KEY, KID, &claims(BUNDLE, "https://appleid.apple.com", now() + 600));
+        let p = decode(&t).expect("valid token");
+        assert_eq!(p.user_id, "001234.abcdef");
+        assert_eq!(p.audience, BUNDLE);
+        assert_eq!(p.email_verified, Some(true));
+        assert_eq!(p.is_private_email, Some(true));
+    }
+
+    #[test]
+    fn wrong_audience_is_rejected() {
+        let t = token(KEY, KID, &claims("com.evil.app", "https://appleid.apple.com", now() + 600));
+        assert!(decode(&t).is_err());
+    }
+
+    #[test]
+    fn wrong_issuer_is_rejected() {
+        let t = token(KEY, KID, &claims(BUNDLE, "https://evil.example", now() + 600));
+        assert!(decode(&t).is_err());
+    }
+
+    #[test]
+    fn expired_token_is_rejected() {
+        let t = token(KEY, KID, &claims(BUNDLE, "https://appleid.apple.com", now() - 3_600));
+        assert!(decode(&t).is_err());
+    }
+
+    #[test]
+    fn token_signed_by_another_key_is_rejected() {
+        let t = token(OTHER_KEY, KID, &claims(BUNDLE, "https://appleid.apple.com", now() + 600));
+        assert!(decode(&t).is_err());
+    }
+
+    #[test]
+    fn unknown_key_id_is_missing_jwk() {
+        let t = token(KEY, "other-kid", &claims(BUNDLE, "https://appleid.apple.com", now() + 600));
+        let client = AppleJwtClient::new(&[BUNDLE]);
+        let err = AppleJwtClient::try_decode("other-kid", &keyset(), &t, &client.validation)
+            .expect_err("unknown kid");
+        assert!(matches!(err, AppleJwtError::MissingJwk(_)));
     }
 }
